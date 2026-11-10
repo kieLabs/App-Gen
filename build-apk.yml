@@ -1,0 +1,191 @@
+name: Build Signed WebView APK
+run-name: Build APK [${{ inputs.build_id }}]
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Unique Build Identifier'
+        required: true
+        type: string
+      app_name:
+        description: 'Application Display Name'
+        required: true
+        type: string
+      package_name:
+        description: 'Java Package Identifier'
+        required: true
+        type: string
+      website_url:
+        description: 'Target HTTPS Website URL'
+        required: true
+        type: string
+      icon_base64:
+        description: 'Base64 Encoded 512x512 Icon'
+        required: true
+        type: string
+      fullscreen:
+        description: 'Enable Fullscreen Mode'
+        required: false
+        default: 'false'
+        type: string
+      webrtc:
+        description: 'Enable Camera and Mic WebRTC'
+        required: false
+        default: 'true'
+        type: string
+      file_uploads:
+        description: 'Enable File Chooser Uploads'
+        required: false
+        default: 'true'
+        type: string
+      pull_to_refresh:
+        description: 'Enable Swipe Pull-to-Refresh'
+        required: false
+        default: 'true'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  assemble-signed-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Android Template Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle Caching
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Inject Dynamic App Configuration & Package Refactoring
+        env:
+          INPUT_APP_NAME: ${{ inputs.app_name }}
+          INPUT_PKG_NAME: ${{ inputs.package_name }}
+          INPUT_WEB_URL: ${{ inputs.website_url }}
+          INPUT_FULLSCREEN: ${{ inputs.fullscreen }}
+          INPUT_WEBRTC: ${{ inputs.webrtc }}
+          INPUT_UPLOADS: ${{ inputs.file_uploads }}
+          INPUT_REFRESH: ${{ inputs.pull_to_refresh }}
+        run: |
+          python3 - << 'EOF'
+          import os
+          import shutil
+          import xml.sax.saxutils as saxutils
+
+          app_name = os.environ.get("INPUT_APP_NAME", "Web2APK App").strip()
+          pkg_name = os.environ.get("INPUT_PKG_NAME", "com.web2apk.template").strip()
+          web_url = os.environ.get("INPUT_WEB_URL", "https://example.com").strip()
+
+          def bool_str(val):
+              return "true" if str(val).lower() == "true" else "false"
+
+          fullscreen = bool_str(os.environ.get("INPUT_FULLSCREEN", "false"))
+          webrtc = bool_str(os.environ.get("INPUT_WEBRTC", "true"))
+          uploads = bool_str(os.environ.get("INPUT_UPLOADS", "true"))
+          refresh = bool_str(os.environ.get("INPUT_REFRESH", "true"))
+
+          # 1. Update strings.xml with XML-escaped app_name
+          escaped_name = saxutils.escape(app_name)
+          strings_path = "app/src/main/res/values/strings.xml"
+          with open(strings_path, "w", encoding="utf-8") as f:
+              f.write(f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <string name="app_name">{escaped_name}</string>\n</resources>\n')
+
+          # 2. Update app/build.gradle namespace and applicationId
+          gradle_path = "app/build.gradle"
+          with open(gradle_path, "r", encoding="utf-8") as f:
+              gradle_content = f.read()
+          gradle_content = gradle_content.replace("com.web2apk.template", pkg_name)
+          with open(gradle_path, "w", encoding="utf-8") as f:
+              f.write(gradle_content)
+
+          # 3. Update AndroidManifest.xml package
+          manifest_path = "app/src/main/AndroidManifest.xml"
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest_content = f.read()
+          manifest_content = manifest_content.replace("com.web2apk.template", pkg_name)
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              f.write(manifest_content)
+
+          # 4. Update MainActivity.java and move to new package directory path
+          old_java_path = "app/src/main/java/com/web2apk/template/MainActivity.java"
+          with open(old_java_path, "r", encoding="utf-8") as f:
+              java_code = f.read()
+
+          safe_java_url = web_url.replace("\\", "\\\\").replace('"', '\\"')
+          java_code = java_code.replace("package com.web2apk.template;", f"package {pkg_name};")
+          java_code = java_code.replace("__TARGET_URL__", safe_java_url)
+          java_code = java_code.replace("__FLAG_FULLSCREEN__", fullscreen)
+          java_code = java_code.replace("__FLAG_WEBRTC__", webrtc)
+          java_code = java_code.replace("__FLAG_FILE_UPLOADS__", uploads)
+          java_code = java_code.replace("__FLAG_PULL_REFRESH__", refresh)
+
+          new_pkg_dir = os.path.join("app/src/main/java", *pkg_name.split("."))
+          os.makedirs(new_pkg_dir, exist_ok=True)
+          new_java_path = os.path.join(new_pkg_dir, "MainActivity.java")
+          with open(new_java_path, "w", encoding="utf-8") as f:
+              f.write(java_code)
+
+          if os.path.abspath(old_java_path) != os.path.abspath(new_java_path):
+              os.remove(old_java_path)
+          EOF
+
+      - name: Decode Base64 Icon and Generate Mipmap PNG Assets
+        env:
+          ICON_B64: ${{ inputs.icon_base64 }}
+        run: |
+          echo "$ICON_B64" | tr -d ' \n\r' | base64 --decode > /tmp/raw_icon.img
+          for dir in mipmap-mdpi mipmap-hdpi mipmap-xhdpi mipmap-xxhdpi mipmap-xxxhdpi; do
+            mkdir -p "app/src/main/res/$dir"
+          done
+          convert /tmp/raw_icon.img -resize 48x48 PNG32:app/src/main/res/mipmap-mdpi/ic_launcher.png
+          convert /tmp/raw_icon.img -resize 72x72 PNG32:app/src/main/res/mipmap-hdpi/ic_launcher.png
+          convert /tmp/raw_icon.img -resize 96x96 PNG32:app/src/main/res/mipmap-xhdpi/ic_launcher.png
+          convert /tmp/raw_icon.img -resize 144x144 PNG32:app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+          convert /tmp/raw_icon.img -resize 192x192 PNG32:app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+      - name: Generate Release Signing Keystore (V1 + V2)
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'cyberapkpass123' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'cyberapkkey' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'cyberapkpass123' }}
+        run: |
+          keytool -genkeypair -v \
+            -keystore app/release-keystore.jks \
+            -storetype JKS \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -alias "$KEY_ALIAS" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            -dname "CN=CyberAPK Studio, OU=Mobile Engineering, O=CyberAPK, L=San Francisco, S=CA, C=US"
+
+      - name: Compile and Sign Release APK via Gradle
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'cyberapkpass123' }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'cyberapkkey' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'cyberapkpass123' }}
+        run: |
+          gradle assembleRelease --no-daemon --stacktrace
+          mv app/build/outputs/apk/release/app-release.apk "app/build/outputs/apk/release/${{ inputs.build_id }}.apk"
+
+      - name: Publish Signed APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.build_id }}" \
+            "app/build/outputs/apk/release/${{ inputs.build_id }}.apk" \
+            --title "Signed APK Build: ${{ inputs.app_name }} (${{ inputs.build_id }})" \
+            --notes "Automated WebView Release APK for **${{ inputs.app_name }}** (\`${{ inputs.package_name }}\`) pointing to ${{ inputs.website_url }}."
